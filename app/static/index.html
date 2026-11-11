@@ -112,6 +112,10 @@
           <table>
             <thead>
               <tr>
+                <th scope="col" class="col-check">
+                  <input type="checkbox" id="select-all"
+                         aria-label="全选所有高权限文件" disabled>
+                </th>
                 <th scope="col">文件路径</th>
                 <th scope="col">八进制权限</th>
                 <th scope="col">特殊位</th>
@@ -125,7 +129,58 @@
         <div class="empty-state" id="empty-state" hidden>
           <span class="empty-check" aria-hidden="true">✓</span>
           <h3>未发现 SUID / SGID 普通文件</h3>
-          <p>最终合并视图中没有保留高权限位的普通文件。</p>
+          <p>最终合并视图中没有保留高权限位的普通文件，无需生成降权补丁。</p>
+        </div>
+      </div>
+
+      <div class="panel repair-panel" id="repair-panel" hidden aria-labelledby="repair-title">
+        <div class="repair-heading">
+          <div>
+            <p class="section-kicker">03 · 降权修复</p>
+            <h3 id="repair-title">生成可重新 docker load 的降权镜像</h3>
+            <p class="repair-note">
+              仅支持外层与图层均<strong>未压缩</strong>的单镜像 docker save tar。
+              服务端会重新合并核对所选路径；任一路径不是最终高权限普通文件则整批拒绝。
+              修复仅追加一个补丁层，清除所选文件的 SUID/SGID 位，保留正文、UID/GID 与其余权限；原层字节不变。
+            </p>
+          </div>
+          <div class="repair-selection" aria-live="polite">
+            已选 <strong id="repair-selected-count">0</strong> / <span id="repair-total-count">0</span>
+          </div>
+        </div>
+        <div class="repair-actions">
+          <button type="button" class="button button-primary" id="repair-button" disabled>
+            <span class="button-label">生成降权镜像</span>
+            <span class="spinner" aria-hidden="true"></span>
+          </button>
+          <span class="muted">正文分块复制，不执行镜像或解包文件；完整生成并校验通过后才开放下载</span>
+        </div>
+        <div class="status-box" id="repair-status" hidden role="status" aria-live="polite"></div>
+        <div class="error-box" id="repair-error" hidden role="alert">
+          <div class="error-heading">
+            <span class="error-icon" aria-hidden="true">!</span>
+            <strong id="repair-error-code">修复失败</strong>
+          </div>
+          <p id="repair-error-message"></p>
+          <p class="error-meta" id="repair-error-meta" hidden></p>
+        </div>
+        <div class="repair-result" id="repair-result" hidden>
+          <div class="repair-result-head">
+            <span class="repair-success-icon" aria-hidden="true">✓</span>
+            <div>
+              <strong id="repair-result-title">降权镜像已生成</strong>
+              <p class="muted" id="repair-result-detail"></p>
+            </div>
+          </div>
+          <div class="repair-result-actions">
+            <a class="button button-primary" id="repair-download" download>
+              下载修复归档
+            </a>
+            <button type="button" class="button button-ghost" id="repair-rescan">
+              扫描修复结果
+            </button>
+          </div>
+          <div class="repair-diff" id="repair-diff"></div>
         </div>
       </div>
     </section>

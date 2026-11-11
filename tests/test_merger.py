@@ -62,10 +62,22 @@ def make_archive(
     unsafe_outer_name: str | None = None,
 ) -> bytes:
     layer_paths = []
+    diff_ids = []
     for index, payload in enumerate(layers):
         layer_paths.append(f"layer-{index}.tar")
+        diff_ids.append("sha256:" + hashlib.sha256(payload).hexdigest())
 
-    config = {"architecture": "amd64", "os": "linux"}
+    config = {
+        "architecture": "amd64",
+        "os": "linux",
+        "config": {
+            "Cmd": ["/bin/sh"],
+            "Labels": {"test.label": "preserve-me"},
+        },
+        "rootfs": {"type": "layers", "diff_ids": diff_ids},
+        "history": [{"created": "2026-01-01T00:00:00Z", "created_by": "test layer"}]
+        * len(layers),
+    }
     config_bytes = json.dumps(config).encode()
     config_digest = hashlib.sha256(config_bytes).hexdigest()
     config_path = f"blobs/sha256/{config_digest}"

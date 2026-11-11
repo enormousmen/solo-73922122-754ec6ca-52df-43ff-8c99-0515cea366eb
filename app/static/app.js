@@ -26,9 +26,27 @@ const layerStrip = byId("layer-strip");
 const findingsBody = byId("findings-body");
 const tableWrap = document.querySelector(".table-wrap");
 const emptyState = byId("empty-state");
+const selectAll = byId("select-all");
+const repairPanel = byId("repair-panel");
+const repairButton = byId("repair-button");
+const repairSelectedCount = byId("repair-selected-count");
+const repairTotalCount = byId("repair-total-count");
+const repairStatus = byId("repair-status");
+const repairError = byId("repair-error");
+const repairErrorCode = byId("repair-error-code");
+const repairErrorMessage = byId("repair-error-message");
+const repairErrorMeta = byId("repair-error-meta");
+const repairResult = byId("repair-result");
+const repairResultDetail = byId("repair-result-detail");
+const repairDownload = byId("repair-download");
+const repairRescan = byId("repair-rescan");
+const repairDiff = byId("repair-diff");
 
 let selectedFile = null;
 let busy = false;
+let repairBusy = false;
+let currentScan = null;
+const checkedPaths = new Set();
 
 function el(tag, className, text) {
   const node = document.createElement(tag);
@@ -109,7 +127,8 @@ function setBusy(nextBusy, label) {
   busy = nextBusy;
   scanButton.classList.toggle("is-busy", nextBusy);
   scanButton.disabled = nextBusy || !selectedFile;
-  demoButton.disabled = nextBusy;
+  demoButton.disabled = nextBusy || repairBusy;
+  if (repairButton) repairButton.disabled = nextBusy || repairBusy || checkedPaths.size === 0;
   if (nextBusy) {
     const text = el("span", "button-label", label || "扫描中");
     const spinner = el("span", "spinner");
@@ -126,10 +145,13 @@ function setBusy(nextBusy, label) {
 }
 
 function chooseFile(file) {
-  if (busy) return;
+  if (busy || repairBusy) return;
   selectedFile = file || null;
   setError(null);
   results.hidden = true;
+  checkedPaths.clear();
+  currentScan = null;
+  if (repairPanel) repairPanel.hidden = true;
 
   if (!selectedFile) {
     input.value = "";
@@ -190,6 +212,21 @@ function makeBadge(bit) {
 function makeFindingRow(item) {
   const tr = el("tr");
 
+  const checkCell = el("td", "check-cell");
+  const checkbox = document.createElement("input");
+  checkbox.type = "checkbox";
+  checkbox.className = "row-check";
+  checkbox.value = item.relative_path;
+  checkbox.setAttribute("aria-label", `选择 ${item.path}`);
+  checkbox.checked = checkedPaths.has(item.relative_path);
+  checkbox.addEventListener("change", () => {
+    if (checkbox.checked) checkedPaths.add(item.relative_path);
+    else checkedPaths.delete(item.relative_path);
+    syncRepairSelection();
+  });
+  checkCell.append(checkbox);
+  tr.append(checkCell);
+
   const pathCell = el("td", "path-cell");
   pathCell.append(el("span", "path-text", item.path));
   tr.append(pathCell);
@@ -229,6 +266,7 @@ function makeFindingRow(item) {
 }
 
 function renderResult(payload) {
+  currentScan = payload;
   const files = payload.files || [];
   const summary = payload.summary || {};
   const layers = payload.layers || [];
@@ -248,16 +286,232 @@ function renderResult(payload) {
   layerStrip.replaceChildren();
   for (const layer of layers) layerStrip.append(makeLayerChip(layer));
 
+  // Drop stale selections that no longer exist in this scan.
+  const currentPaths = new Set(files.map((item) => item.relative_path));
+  for (const path of Array.from(checkedPaths)) {
+    if (!currentPaths.has(path)) checkedPaths.delete(path);
+  }
+
   findingsBody.replaceChildren();
   for (const item of files) findingsBody.append(makeFindingRow(item));
 
   const hasFiles = files.length > 0;
   tableWrap.hidden = !hasFiles;
   emptyState.hidden = hasFiles;
+  repairPanel.hidden = !hasFiles;
+  resetRepairResult();
+  syncRepairSelection();
 
   results.hidden = false;
   results.scrollIntoView({ behavior: "smooth", block: "start" });
 }
+
+function setRepairStatus(message) {
+  if (!message) {
+    repairStatus.hidden = true;
+    repairStatus.textContent = "";
+    return;
+  }
+  repairStatus.hidden = false;
+  repairStatus.textContent = message;
+}
+
+function setRepairError(error) {
+  repairError.hidden = true;
+  if (!error) return;
+  repairErrorCode.textContent = error.code || "修复失败";
+  repairErrorMessage.textContent = error.message || "无法完成修复。";
+  const metaParts = [];
+  if (error.path) metaParts.push(`路径 ${error.path}`);
+  if (error.layer_number !== undefined && error.layer_number !== null) {
+    metaParts.push(`层 ${error.layer_number}`);
+  }
+  if (error.layer_path) metaParts.push(error.layer_path);
+  if (metaParts.length) {
+    repairErrorMeta.hidden = false;
+    repairErrorMeta.textContent = metaParts.join(" · ");
+  } else {
+    repairErrorMeta.hidden = true;
+    repairErrorMeta.textContent = "";
+  }
+  repairError.hidden = false;
+  repairError.scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
+
+function syncRepairSelection() {
+  const files = (currentScan && currentScan.files) || [];
+  const total = files.length;
+  const selected = files.filter((item) => checkedPaths.has(item.relative_path)).length;
+
+  repairSelectedCount.textContent = String(selected);
+  repairTotalCount.textContent = String(total);
+  selectAll.disabled = total === 0;
+  selectAll.checked = total > 0 && selected === total;
+  selectAll.indeterminate = selected > 0 && selected < total;
+  repairButton.disabled = repairBusy || selected === 0;
+}
+
+function resetRepairResult() {
+  repairResult.hidden = true;
+  repairDownload.removeAttribute("href");
+  repairDiff.replaceChildren();
+  setRepairError(null);
+  setRepairStatus("");
+}
+
+selectAll.addEventListener("change", () => {
+  const files = (currentScan && currentScan.files) || [];
+  checkedPaths.clear();
+  if (selectAll.checked) {
+    for (const item of files) checkedPaths.add(item.relative_path);
+  }
+  for (const box of findingsBody.querySelectorAll(".row-check")) {
+    box.checked = selectAll.checked;
+  }
+  syncRepairSelection();
+});
+
+function setRepairBusy(nextBusy, label) {
+  repairBusy = nextBusy;
+  repairButton.classList.toggle("is-busy", nextBusy);
+  repairButton.disabled = nextBusy || checkedPaths.size === 0;
+  demoButton.disabled = busy || nextBusy;
+  selectAll.disabled = nextBusy;
+  for (const box of findingsBody.querySelectorAll(".row-check")) box.disabled = nextBusy;
+  if (nextBusy) {
+    repairButton.replaceChildren(
+      el("span", "button-label", label || "生成中"),
+      (() => {
+        const spinner = el("span", "spinner");
+        spinner.setAttribute("aria-hidden", "true");
+        return spinner;
+      })()
+    );
+  } else {
+    repairButton.replaceChildren(
+      el("span", "button-label", "生成降权镜像"),
+      (() => {
+        const spinner = el("span", "spinner");
+        spinner.setAttribute("aria-hidden", "true");
+        return spinner;
+      })()
+    );
+  }
+}
+
+function renderRepairDiff(job) {
+  const report = (job && job.report) || {};
+  const items = report.selected_files || [];
+  repairDiff.replaceChildren();
+  if (!items.length) return;
+
+  const heading = el("h4", null, "补丁层变更明细");
+  repairDiff.append(heading);
+  const list = el("ul", "repair-diff-list");
+  for (const item of items) {
+    const li = el("li");
+    li.append(el("code", "repair-path", item.path));
+    const change = el(
+      "span",
+      "repair-mode-change",
+      `${item.old_mode_octal} → ${item.new_mode_octal}`
+    );
+    li.append(change);
+    li.append(
+      el(
+        "span",
+        "repair-meta",
+        `UID/GID ${item.uid}:${item.gid} · 正文 ${item.body_digest.slice(0, 19)}…`
+      )
+    );
+    list.append(li);
+  }
+  repairDiff.append(list);
+}
+
+async function runRepair() {
+  if (repairBusy || !currentScan) return;
+  const paths = Array.from(checkedPaths).sort();
+  if (!paths.length) {
+    setRepairError({ code: "selection_empty", message: "请至少勾选一个高权限文件。" });
+    return;
+
+  }
+  const isDemo = currentScan.source === "built-in-demo";
+  if (!isDemo && !selectedFile) {
+    setRepairError({
+      code: "file_missing",
+      message: "请重新选择原始归档后再发起修复（修复请求需要携带原 tar）。",
+    });
+    return;
+  }
+
+  setRepairError(null);
+  resetRepairResult();
+  setRepairBusy(true, "重新合并核对并生成归档");
+  setRepairStatus("服务端正在重新合并 whiteout、核对所选路径，并分块复制正文生成补丁层…");
+
+  try {
+    const formData = new FormData();
+    if (isDemo) {
+      formData.append("paths_json", JSON.stringify(paths));
+    } else {
+      formData.append("archive", selectedFile, selectedFile.name);
+      for (const path of paths) formData.append("paths", path);
+    }
+    const endpoint = isDemo ? "/api/demo/repair" : "/api/repair";
+    const response = await fetch(endpoint, {
+      method: "POST",
+      body: formData,
+      headers: { Accept: "application/json" },
+    });
+    const payload = await parseResponse(response);
+    const job = payload.job;
+    repairDownload.href = job.download_url;
+    repairDownload.setAttribute("download", job.download_name);
+    repairResultDetail.textContent =
+      `补丁层 ${job.report.patch_layer.path} · 输出 ${formatBytes(job.report.output_size)} · 任务 ${job.job_id.slice(0, 8)}`;
+    renderRepairDiff(job);
+    repairResult.hidden = false;
+    setRepairStatus("");
+    repairResult.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  } catch (error) {
+    setRepairStatus("");
+    if (error && typeof error === "object" && "message" in error) {
+      setRepairError(error);
+    } else {
+      setRepairError({ code: "network_error", message: "网络请求失败，请确认服务正在运行。" });
+    }
+  } finally {
+    setRepairBusy(false);
+    syncRepairSelection();
+  }
+}
+
+repairButton.addEventListener("click", runRepair);
+
+repairRescan.addEventListener("click", async () => {
+  const href = repairDownload.getAttribute("href");
+  if (!href || repairBusy) return;
+  const jobId = href.split("/").slice(-2, -1)[0];
+  setRepairError(null);
+  setRepairStatus("正在扫描刚生成的降权镜像…");
+  try {
+    const response = await fetch(`/api/repair/jobs/${encodeURIComponent(jobId)}/scan`, {
+      method: "POST",
+      headers: { Accept: "application/json" },
+    });
+    const payload = await parseResponse(response);
+    setRepairStatus("");
+    renderResult(payload);
+  } catch (error) {
+    setRepairStatus("");
+    setRepairError(error && error.message ? error : {
+      code: "network_error",
+      message: "扫描修复结果失败。",
+    });
+  }
+});
 
 async function runScan({ file, demo }) {
   if (busy) return;

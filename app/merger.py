@@ -18,6 +18,57 @@ SPECIAL_BITS = SUID_BIT | SGID_BIT
 OPAQUE_WHITEOUT = ".wh..wh..opq"
 WHITEOUT_PREFIX = ".wh."
 
+# Magic bytes of the compression formats that ``tarfile`` would otherwise
+# transparently accept.  Repair mode rejects all of them explicitly because the
+# repair contract covers uncompressed outer and layer tars only.
+COMPRESSION_MAGIC: tuple[tuple[bytes, str], ...] = (
+    (b"\x1f\x8b", "gzip"),
+    (b"BZh", "bzip2"),
+    (b"\xfd7zXZ\x00", "xz"),
+    (b"\x28\xb5\x2f\xfd", "zstd"),
+)
+
+
+class _PrefixedStream:
+    """Expose a small already-read header followed by the rest of a stream.
+
+    ``tarfile`` streaming mode only needs :meth:`read`, so this lets the
+    compression check consume the first bytes without seeking the layer
+    member (outer archive members are not seekable in general).
+    """
+
+    def __init__(self, head: bytes, stream: BinaryIO) -> None:
+        self._head = head
+        self._stream = stream
+        self._position = 0
+
+    def read(self, size: int = -1) -> bytes:
+        if self._position < len(self._head):
+            if size is None or size < 0:
+                chunk = self._head[self._position :]
+                self._position = len(self._head)
+                return chunk + self._stream.read(-1)
+            chunk = self._head[self._position : self._position + size]
+            self._position += len(chunk)
+            if len(chunk) == size:
+                return chunk
+            return chunk + self._stream.read(size - len(chunk))
+        return self._stream.read(size)
+
+    def close(self) -> None:
+        self._stream.close()
+
+
+def reject_compressed_bytes(head: bytes, label: str = "输入") -> None:
+    """Raise a clear error when ``head`` begins with a compression signature."""
+
+    for magic, name in COMPRESSION_MAGIC:
+        if head.startswith(magic):
+            raise ScanError(
+                "compressed_unsupported",
+                f"{label} 使用了 {name} 压缩；修复仅支持外层与图层均未压缩的 tar",
+            )
+
 
 def _display_text(value: str) -> str:
     """Make a possibly non-UTF-8 tar name safe for JSON/UI output."""
@@ -108,6 +159,9 @@ class ScanResult:
     image: dict
     layers: list[LayerInfo]
     files: list[dict]
+    # Full merged view: normalized relative path -> current FsEntry.  Used by
+    # the repair flow to re-verify user selection.  Not serialized to the API.
+    entries: dict[str, FsEntry] = field(default_factory=dict)
 
     def as_dict(self, *, source: str) -> dict:
         suid_count = sum(1 for item in self.files if "SUID" in item["special_bits"])
@@ -375,6 +429,8 @@ def _parse_layer(
     outer: tarfile.TarFile,
     member: tarfile.TarInfo,
     layer: LayerInfo,
+    *,
+    uncompressed_only: bool = False,
 ) -> tuple[list[FileRecord], list[str], list[str]]:
     records: list[FileRecord] = []
     whiteouts: list[str] = []
@@ -390,9 +446,17 @@ def _parse_layer(
         )
 
     try:
-        # r|* streams the layer and transparently detects gzip/xz/bz2,
-        # without writing any unpacked bytes anywhere.
-        with tarfile.open(fileobj=extracted, mode="r|*") as layer_tar:
+        if uncompressed_only:
+            head = extracted.read(6)
+            reject_compressed_bytes(head, f"镜像层 {layer.path}")
+            layer_stream: BinaryIO = _PrefixedStream(head, extracted)
+            open_mode = "r|"
+        else:
+            layer_stream = extracted
+            open_mode = "r|*"
+        # Streaming reads never write unpacked bytes anywhere; r|* also
+        # transparently detects gzip/xz/bz2 in the permissive scan mode.
+        with tarfile.open(fileobj=layer_stream, mode=open_mode) as layer_tar:
             for tar_info in layer_tar:
                 try:
                     path = normalize_archive_path(
@@ -467,6 +531,8 @@ def _parse_layer(
                     FileRecord(
                         path=path,
                         kind=kind,
+                        # Keep all 12 permission bits (incl. sticky 0o1000);
+                        # the repair must preserve every non-SUID/SGID bit.
                         mode=int(tar_info.mode or 0) & 0o7777,
                         uid=int(tar_info.uid or 0),
                         gid=int(tar_info.gid or 0),
@@ -487,16 +553,43 @@ def _parse_layer(
     return records, whiteouts, opaque_parents
 
 
-def scan_docker_archive(fileobj: BinaryIO) -> ScanResult:
-    """Scan a single-image ``docker save`` tar without extracting anything."""
+def _index_entries(root: _Node) -> dict[str, FsEntry]:
+    index: dict[str, FsEntry] = {}
+
+    stack: list[tuple[_Node, list[str]]] = [(root, [])]
+    while stack:
+        node, parts = stack.pop()
+        if node.entry is not None:
+            index["/".join(parts)] = node.entry
+        for name, child in node.children.items():
+            stack.append((child, parts + [name]))
+    return index
+
+
+def scan_docker_archive(
+    fileobj: BinaryIO, *, uncompressed_only: bool = False
+) -> ScanResult:
+    """Scan a single-image ``docker save`` tar without extracting anything.
+
+    With ``uncompressed_only=True`` both the outer archive and every layer
+    must be plain (uncompressed) tars; compressed inputs are rejected with a
+    dedicated :class:`ScanError` instead of being transparently decompressed.
+    """
 
     try:
         fileobj.seek(0)
     except (AttributeError, OSError) as exc:
         raise ScanError("archive_unreadable", f"无法定位上传文件：{exc}") from exc
 
+    if uncompressed_only:
+        head = fileobj.read(6)
+        reject_compressed_bytes(head, "外层 docker 归档")
+        fileobj.seek(0)
+
     try:
-        outer = tarfile.open(fileobj=fileobj, mode="r:*")
+        outer = tarfile.open(
+            fileobj=fileobj, mode="r:" if uncompressed_only else "r:*"
+        )
     except (tarfile.TarError, EOFError, OSError) as exc:
         raise ScanError("archive_invalid", f"上传文件不是有效的 tar 归档：{exc}") from exc
 
@@ -596,7 +689,9 @@ def scan_docker_archive(fileobj: BinaryIO) -> ScanResult:
                 path=layer_path,
                 name=_layer_name(layer_path),
             )
-            records, whiteouts, opaque_parents = _parse_layer(outer, member, layer)
+            records, whiteouts, opaque_parents = _parse_layer(
+                outer, member, layer, uncompressed_only=uncompressed_only
+            )
             _apply_layer(root, records, whiteouts, opaque_parents, layer)
             layers.append(layer)
 
@@ -611,7 +706,12 @@ def scan_docker_archive(fileobj: BinaryIO) -> ScanResult:
             "config_path": config_path,
         }
 
-        return ScanResult(image=image_info, layers=layers, files=files)
+        return ScanResult(
+            image=image_info,
+            layers=layers,
+            files=files,
+            entries=_index_entries(root),
+        )
 
 
 def iter_archive_files(fileobj: BinaryIO) -> Iterator[dict]:

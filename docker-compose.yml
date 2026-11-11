@@ -8,9 +8,11 @@ services:
       - "${APP_PORT:-8000}:8000"
     environment:
       TMPDIR: /tmp
+      PRIV_AUDIT_JOB_DIR: /tmp/privilege-audit-jobs
+      PRIV_AUDIT_JOB_TTL: "3600"
     read_only: true
     tmpfs:
-      - "/tmp:size=${UPLOAD_TMP_SIZE:-512m},mode=1777"
+      - "/tmp:size=${UPLOAD_TMP_SIZE:-1024m},mode=1777"
     cap_drop:
       - ALL
     security_opt:
